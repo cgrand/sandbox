@@ -146,5 +146,92 @@
         'if* (concat (take 2 expr) (map #(distribute f %) (drop 2 expr)))
         (list f expr)))
     (list f expr)))
-    
-    
+
+
+;;;;;;;;;;;
+
+(declare interpret)
+
+(defn interpret-call [locals form]
+  (let [[f & args] (doall (map #(interpret locals %) form))]
+    (apply f args)))
+
+(defmulti interpret-form (fn [_ form] (first form)))
+
+(defmethod interpret-form :default [locals [op :as form]]
+  (if (contains? locals op)
+    (interpret-call locals form)
+    (let [ex-form (macroexpand form)]
+      (if (= form ex-form)
+        (interpret-call locals form)
+        (interpret locals ex-form)))))
+
+(defmethod interpret-form 'if* [locals [_ test then else]]
+  (interpret locals (if (interpret locals test) then else)))
+
+(defn interpret-forms [locals forms]
+  (last (map #(interpret locals %) forms)))
+  
+(defmethod interpret-form 'do [locals [_ & forms]]
+  (interpret-forms locals forms))
+
+(defmethod interpret-form 'let* [locals [_ bindings & forms]]
+  (interpret-forms 
+    (reduce (fn [locals [k v]] (assoc locals k (interpret locals v))) 
+      locals (partition 2 bindings))
+    forms))   
+
+(defmethod interpret-form 'loop* [locals [_ bindings & forms]]
+  (let [locs (take-nth 2 bindings)]
+    (interpret locals `(let ~bindings ((fn [~@locs] ~@forms) ~@locs)))))  
+
+(defmethod interpret-form 'quote [locals [_ & forms]]
+  forms)
+
+(defn interpret-fn-body [locals name arglist forms]
+  (let [[fixargs [_ vararg]] (split-with #(not= '& %) arglist)
+        n (count fixargs)
+        m (if vararg -1 n)]
+    [m (fn this [& vals]
+         (let [locals (if name (assoc locals name this) locals)
+               locals (into locals (zipmap fixargs vals))
+               locals (if vararg 
+                        (assoc locals vararg (seq (drop n vals)))
+                        locals)
+               locals (assoc locals 'recur this)]
+           (interpret-forms locals forms)))])) 
+
+(defmethod interpret-form 'fn* [locals [_ arglist & forms :as f]]
+  (let [name (when (symbol? arglist) arglist)
+        arglist (if name (first forms) arglist)
+        forms (if name (next forms) forms)
+        bodies (if (vector? arglist) [(cons arglist forms)] (cons arglist forms))
+        arity-map (into {} (map (fn [[arglist & forms]] (interpret-fn-body locals name arglist forms)) bodies))
+        fixmax (apply max (keys arity-map))]
+    (fn [& vals]
+      (let [n (if (or (neg? fixmax) (seq (drop fixmax vals))) -1 (count vals))] 
+        (apply (arity-map n) vals)))))
+
+(defn interpret-seq [locals form]
+  (if (seq form)
+    (interpret-form locals form)
+    form))
+
+(defn interpret
+ [locals form]
+  (cond
+    (seq? form)
+      (interpret-seq locals form)
+    (vector? form)
+      (vec (map #(interpret locals %) form))
+    (set? form)
+      (set (map #(interpret locals %) form))
+    (map? form)
+      (into (empty form) (map #(map (partial interpret locals) %) form))
+    (symbol? form)
+      (if (contains? locals form)
+        (locals form)
+        (deref (resolve form)))
+    :else
+      form))
+ 
