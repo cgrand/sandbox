@@ -156,37 +156,60 @@
   (let [[f & args] (doall (map #(interpret locals %) form))]
     (apply f args)))
 
-(defmulti interpret-form (fn [_ form] (first form)))
-
-(defmethod interpret-form :default [locals [op :as form]]
+(defn interpret-form-default [locals [op :as form]]
   (if (contains? locals op)
     (interpret-call locals form)
     (let [ex-form (macroexpand form)]
       (if (= form ex-form)
         (interpret-call locals form)
         (interpret locals ex-form)))))
+        
+  
+(def *special-interpreters* {
+  'if* 
+    (fn [locals [_ test then else]]
+      (interpret locals (if (interpret locals test) then else)))
+  'do 
+    (fn [locals [_ & forms]]
+      (interpret-forms locals forms))
+  'let* 
+    (fn [locals [_ bindings & forms]]
+      (interpret-forms 
+        (reduce (fn [locals [k v]] (assoc locals k (interpret locals v))) 
+          locals (partition 2 bindings))
+        forms))   
+  'loop* 
+    (fn [locals [_ bindings & forms]]
+      (let [locs (take-nth 2 bindings)]
+        (interpret locals `(let ~bindings ((fn [~@locs] ~@forms) ~@locs)))))  
+  'quote 
+    (fn [locals [_ & forms]]
+      forms)
+  'new 
+    (fn [locals [_ class & forms]]
+      (clojure.lang.Reflector/invokeConstructor (resolve class) (to-array (map #(interpret locals %) forms)))) 
+  '. 
+    (fn [locals [_ obj member & forms]]
+      (if forms
+        (clojure.lang.Reflector/invokeInstanceMethod (interpret locals obj) (name member) (to-array (map #(interpret locals %) forms)))
+        (clojure.lang.Reflector/invokeNoArgInstanceMember (interpret locals obj) (name member)))) 
+  'fn* 
+    (fn [locals [_ arglist & forms :as f]]
+      (let [name (when (symbol? arglist) arglist)
+            arglist (if name (first forms) arglist)
+            forms (if name (next forms) forms)
+            bodies (if (vector? arglist) [(cons arglist forms)] (cons arglist forms))
+            arity-map (into {} (map (fn [[arglist & forms]] (interpret-fn-body locals name arglist forms)) bodies))
+            fixmax (apply max (keys arity-map))]
+        (fn [& vals]
+          (let [n (if (or (neg? fixmax) (seq (drop fixmax vals))) -1 (count vals))] 
+            (apply (arity-map n) vals)))))})          
 
-(defmethod interpret-form 'if* [locals [_ test then else]]
-  (interpret locals (if (interpret locals test) then else)))
+(defn interpret-form [locals form]
+  ((*special-interpreters* (first form) interpret-form-default) locals form))
 
 (defn interpret-forms [locals forms]
   (last (map #(interpret locals %) forms)))
-  
-(defmethod interpret-form 'do [locals [_ & forms]]
-  (interpret-forms locals forms))
-
-(defmethod interpret-form 'let* [locals [_ bindings & forms]]
-  (interpret-forms 
-    (reduce (fn [locals [k v]] (assoc locals k (interpret locals v))) 
-      locals (partition 2 bindings))
-    forms))   
-
-(defmethod interpret-form 'loop* [locals [_ bindings & forms]]
-  (let [locs (take-nth 2 bindings)]
-    (interpret locals `(let ~bindings ((fn [~@locs] ~@forms) ~@locs)))))  
-
-(defmethod interpret-form 'quote [locals [_ & forms]]
-  forms)
 
 (defn interpret-fn-body [locals name arglist forms]
   (let [[fixargs [_ vararg]] (split-with #(not= '& %) arglist)
@@ -200,17 +223,6 @@
                         locals)
                locals (assoc locals 'recur this)]
            (interpret-forms locals forms)))])) 
-
-(defmethod interpret-form 'fn* [locals [_ arglist & forms :as f]]
-  (let [name (when (symbol? arglist) arglist)
-        arglist (if name (first forms) arglist)
-        forms (if name (next forms) forms)
-        bodies (if (vector? arglist) [(cons arglist forms)] (cons arglist forms))
-        arity-map (into {} (map (fn [[arglist & forms]] (interpret-fn-body locals name arglist forms)) bodies))
-        fixmax (apply max (keys arity-map))]
-    (fn [& vals]
-      (let [n (if (or (neg? fixmax) (seq (drop fixmax vals))) -1 (count vals))] 
-        (apply (arity-map n) vals)))))
 
 (defn interpret-seq [locals form]
   (if (seq form)
@@ -231,7 +243,10 @@
     (symbol? form)
       (if (contains? locals form)
         (locals form)
-        (deref (resolve form)))
+        (let [r (resolve form)]
+          (if (var? r)
+            (deref r)
+            r)))
     :else
       form))
  
